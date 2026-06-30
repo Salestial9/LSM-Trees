@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LSM Tree Visualizer — WASM Connected</title>
+<style>
+    body { font-family: 'Inter', sans-serif; margin: 20px; background:#f4f6f8; }
+    h1 { text-align: center; font-size: 32px; margin-bottom: 20px; }
+    .container { display: flex; justify-content: space-around; margin-top: 20px; gap:20px; }
+    .box { background:white; border-radius: 12px; padding: 20px; width: 45%; min-height: 200px; box-shadow:0 4px 12px rgba(0,0,0,0.1); }
+    .box h2 { text-align: center; margin-top: 0; font-size:22px; }
+    .key { display: inline-block; margin: 4px; padding: 6px 12px; border-radius: 8px; background: linear-gradient(135deg,#7ed6df,#22a6b3); color: #fff; font-weight:600; }
+    .sstable { background: linear-gradient(135deg,#f0932b,#eb4d4b); color: #fff; margin: 8px 0; padding: 10px; border-radius: 10px; font-weight:600; }
+    .found { background: linear-gradient(135deg,#6ab04c,#badc58) !important; color:#fff !important; }
+
+    .controls { text-align: center; margin-top: 20px; }
+    input[type=text] { padding: 10px; margin: 0 5px; width: 130px; border-radius:8px; border:1px solid #ccc; }
+    button { padding: 10px 16px; margin: 0 8px; border-radius:8px; border:none; background:#0984e3; color:white; font-weight:600; cursor:pointer; transition:0.2s; }
+    button:hover { background:#74b9ff; }
+    #status { text-align:center; margin-top:12px; color:#333; }
+</style>
+
+</head>
+<body>
+
+<h1>LSM Tree Visualizer — WASM Connected</h1>
+
+<div class="controls">
+    <input type="text" id="keyInput" placeholder="Key">
+    <input type="text" id="valueInput" placeholder="Value">
+    <button id="insertBtn">Insert</button>
+    <button id="getBtn">Get</button>
+    <button id="flushBtn">Flush</button>
+    <button id="compactBtn">Compact</button>
+</div>
+
+<div id="status">WASM not loaded yet — wait for "WASM Ready" in console.</div>
+
+<div class="container">
+    <div class="box" id="memtableBox">
+        <h2>Memtable</h2>
+        <div id="memtableContent"></div>
+    </div>
+
+    <div class="box" id="sstableBox">
+        <h2>SSTables</h2>
+        <div id="sstableContent"></div>
+    </div>
+</div>
+
+<script src="lsm.js"></script>
+<script>
+/*
+  This UI mirrors the memtable and SSTables in JavaScript and also invokes
+  the compiled C++ LSM functions inside WebAssembly so the logic runs in WASM.
+  Note: the C++ module does not expose listing functions, so JS keeps the UI state.
+*/
+
+let putFunc = null, getFunc = null, flushFunc = null, compactFunc = null;
+
+const MEMTABLE_THRESHOLD = 4;
+let memtable = new Map();
+let sstables = []; // array of Maps
+
+function render() {
+    const memDiv = document.getElementById("memtableContent");
+    memDiv.innerHTML = '';
+    for (let [k,v] of memtable.entries()) {
+        const span = document.createElement('span');
+        span.className = 'key';
+        span.textContent = k + "=" + v;
+        memDiv.appendChild(span);
+    }
+
+    const sstDiv = document.getElementById("sstableContent");
+    sstDiv.innerHTML='';
+    sstables.forEach((sst, idx) => {
+        const sDiv = document.createElement('div');
+        sDiv.className = 'sstable';
+        sDiv.textContent = `SSTable ${idx}: ` + Array.from(sst.entries()).map(([k,v]) => `${k}=${v}`).join(", ");
+        sstDiv.appendChild(sDiv);
+    });
+}
+
+function highlightKey(key) {
+    document.querySelectorAll('.key').forEach(el => {
+        if (el.textContent.startsWith(key+"=")) el.classList.add('found');
+        else el.classList.remove('found');
+    });
+    document.querySelectorAll('.sstable').forEach(el => {
+        if (el.textContent.includes(key+"=")) el.classList.add('found');
+        else el.classList.remove('found');
+    });
+}
+
+function enableControls() {
+    document.getElementById("status").textContent = "WASM Ready — functions bound.";
+    document.getElementById("insertBtn").disabled = false;
+    document.getElementById("getBtn").disabled = false;
+    document.getElementById("flushBtn").disabled = false;
+    document.getElementById("compactBtn").disabled = false;
+}
+
+// Hook UI buttons
+document.getElementById("insertBtn").addEventListener('click', () => {
+    const key = document.getElementById("keyInput").value.trim();
+    const value = document.getElementById("valueInput").value;
+    if (!key) { alert("Enter a key!"); return; }
+
+    // Call WASM put
+    putFunc(key, value);
+
+    // Mirror in JS memtable for UI
+    memtable.set(key, value);
+
+    // Auto flush if threshold reached (mirror of WASM behavior)
+    if (memtable.size >= MEMTABLE_THRESHOLD) {
+        flushMemtable();
+    } else {
+        render();
+    }
+});
+
+document.getElementById("getBtn").addEventListener('click', () => {
+    const key = document.getElementById("keyInput").value.trim();
+    if (!key) { alert("Enter a key!"); return; }
+
+    // Call WASM get
+    const res = getFunc(key);
+    if (res === "NOTFOUND") {
+        alert(`Key "${key}" NOT FOUND`);
+    } else {
+        alert(`Key "${key}" = ${res}`);
+        highlightKey(key);
+    }
+});
+
+function flushMemtable() {
+    if (memtable.size === 0) return;
+    // Call WASM flush
+    flushFunc();
+
+    // Mirror to JS sstables
+    const sorted = new Map([...memtable.entries()].sort());
+    sstables.push(sorted);
+    memtable.clear();
+    render();
+}
+
+document.getElementById("flushBtn").addEventListener('click', flushMemtable);
+
+document.getElementById("compactBtn").addEventListener('click', () => {
+    if (sstables.length <= 1) {
+        alert("Nothing to compact");
+        return;
+    }
+    // Call WASM compact
+    compactFunc();
+
+    // JS-side merge (to reflect compaction in UI)
+    const merged = new Map();
+    sstables.forEach(sst => {
+        for (let [k,v] of sst.entries()) merged.set(k,v);
+    });
+    sstables = [new Map([...merged.entries()].sort())];
+    render();
+});
+
+// Wait for WASM Module
+Module.onRuntimeInitialized = () => {
+    putFunc = Module.cwrap('put', null, ['string','string']);
+    getFunc = Module.cwrap('get', 'string', ['string']);
+    flushFunc = Module.cwrap('flush_table', null, []);
+    compactFunc = Module.cwrap('compact_table', null, []);
+
+    enableControls();
+    render();
+    console.log("WASM Ready and connected to UI.");
+};
+
+// Disable buttons until WASM ready
+document.getElementById("insertBtn").disabled = true;
+document.getElementById("getBtn").disabled = true;
+document.getElementById("flushBtn").disabled = true;
+document.getElementById("compactBtn").disabled = true;
+
+</script>
+</body>
+</html>
